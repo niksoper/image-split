@@ -32,7 +32,7 @@ program
   .argument("<inputDir>", "Directory containing scanned images (required)")
   .argument("[outputDir]", "Directory to save cropped photos (default: {inputDir}/output_{timestamp})")
   .option("--min-area <fraction>", "Minimum photo area as a fraction of total image area. Detected regions smaller than this are ignored as noise", parseFloat, DEFAULTS.minArea)
-  .option("--padding <pixels>", "Extra pixels added around each detected photo when cropping to avoid clipping edges", parseInt, DEFAULTS.padding)
+  .option("--padding <pixels>", "Pixels to add (positive) or remove (negative) around each detected photo edge. Use a negative value to eliminate any remaining white border", parseInt, DEFAULTS.padding)
   .option("--threshold <value>", "Brightness cutoff (0-255) for distinguishing photos from the light scanner background. Pixels brighter than this are treated as background", parseInt, DEFAULTS.threshold)
   .option("--blur <sigma>", "Gaussian blur radius applied during detection to smooth out noise and small details within photos", parseFloat, DEFAULTS.blur)
   .option("--scale <factor>", "Downscale factor (0-1) for the detection pass. Smaller values are faster but give less precise crop boundaries", parseFloat, DEFAULTS.scale)
@@ -191,16 +191,51 @@ async function processImage(inputPath, outputDir, filename, opts) {
     const bounds = photos[i];
     // Map from downscaled coordinates back to original resolution and apply padding
     const scale = 1 / DETECTION_SCALE;
-    const left = Math.max(0, Math.round(bounds.minX * scale) - PADDING);
-    const top = Math.max(0, Math.round(bounds.minY * scale) - PADDING);
-    const right = Math.min(
+    let left = Math.max(0, Math.round(bounds.minX * scale) - PADDING);
+    let top = Math.max(0, Math.round(bounds.minY * scale) - PADDING);
+    let right = Math.min(
       width,
       Math.round((bounds.maxX + 1) * scale) + PADDING
     );
-    const bottom = Math.min(
+    let bottom = Math.min(
       height,
       Math.round((bounds.maxY + 1) * scale) + PADDING
     );
+
+    // Refine crop at full resolution: threshold the crop region to trim any
+    // remaining background pixels that the downscaled detection couldn't resolve
+    const coarseCropW = right - left;
+    const coarseCropH = bottom - top;
+    const cropGray = await sharp(inputPath)
+      .extract({ left, top, width: coarseCropW, height: coarseCropH })
+      .grayscale()
+      .raw()
+      .toBuffer();
+
+    let trimLeft = coarseCropW, trimTop = coarseCropH, trimRight = 0, trimBottom = 0;
+    for (let cy = 0; cy < coarseCropH; cy++) {
+      for (let cx = 0; cx < coarseCropW; cx++) {
+        if (cropGray[cy * coarseCropW + cx] < BG_THRESHOLD) {
+          trimLeft = Math.min(trimLeft, cx);
+          trimTop = Math.min(trimTop, cy);
+          trimRight = Math.max(trimRight, cx);
+          trimBottom = Math.max(trimBottom, cy);
+        }
+      }
+    }
+
+    if (trimRight >= trimLeft && trimBottom >= trimTop) {
+      // Refine bounds: convert trim offsets to absolute coordinates and apply padding
+      // Negative padding shrinks the crop inward, removing edge pixels
+      left = Math.max(0, left + trimLeft - PADDING);
+      top = Math.max(0, top + trimTop - PADDING);
+      right = Math.min(width, left + (trimRight - trimLeft + 1) + PADDING * 2);
+      bottom = Math.min(height, top + (trimBottom - trimTop + 1) + PADDING * 2);
+
+      // Ensure minimum 1px crop
+      if (right <= left) right = left + 1;
+      if (bottom <= top) bottom = top + 1;
+    }
 
     const cropWidth = right - left;
     const cropHeight = bottom - top;
