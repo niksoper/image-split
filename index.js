@@ -19,8 +19,9 @@ const DEFAULTS = {
   minArea: 0.01,
   padding: 10,
   threshold: 225,
-  blur: 5,
-  scale: 0.25,
+  blur: 1,
+  scale: 0.5,
+  erode: 5,
 };
 
 program
@@ -35,6 +36,8 @@ program
   .option("--threshold <value>", "Brightness cutoff (0-255) for distinguishing photos from the light scanner background. Pixels brighter than this are treated as background", parseInt, DEFAULTS.threshold)
   .option("--blur <sigma>", "Gaussian blur radius applied during detection to smooth out noise and small details within photos", parseFloat, DEFAULTS.blur)
   .option("--scale <factor>", "Downscale factor (0-1) for the detection pass. Smaller values are faster but give less precise crop boundaries", parseFloat, DEFAULTS.scale)
+  .option("--erode <pixels>", "Erosion radius applied to the detection mask to separate photos that are close together. Increase if adjacent photos are merged", parseInt, DEFAULTS.erode)
+  .option("--rotate <count>", "Number of 90-degree clockwise rotations (1-4) to apply to each output image. Useful when scanned photos have the wrong orientation", parseInt)
   .action(async (inputDir, outputDir, opts) => {
     const absInput = path.resolve(inputDir);
 
@@ -84,7 +87,7 @@ if (process.argv.length <= 2) {
 program.parse();
 
 async function processImage(inputPath, outputDir, filename, opts) {
-  const { minArea: MIN_AREA_FRACTION, padding: PADDING, threshold: BG_THRESHOLD, blur: BLUR_SIGMA, scale: DETECTION_SCALE } = opts;
+  const { minArea: MIN_AREA_FRACTION, padding: PADDING, threshold: BG_THRESHOLD, blur: BLUR_SIGMA, scale: DETECTION_SCALE, erode: ERODE_RADIUS } = opts;
   const metadata = await sharp(inputPath).metadata();
   const { width, height } = metadata;
 
@@ -105,7 +108,11 @@ async function processImage(inputPath, outputDir, filename, opts) {
     mask[i] = blurred[i] < BG_THRESHOLD ? 1 : 0;
   }
 
-  // Find connected components using flood fill
+  // Apply erosion to separate photos that are close together.
+  // Erosion shrinks foreground regions, widening gaps between adjacent photos.
+  const eroded = erode(mask, dWidth, dHeight, ERODE_RADIUS);
+
+  // Find connected components on the eroded mask
   const labels = new Int32Array(dWidth * dHeight);
   let nextLabel = 1;
   const componentBounds = new Map();
@@ -113,9 +120,9 @@ async function processImage(inputPath, outputDir, filename, opts) {
   for (let y = 0; y < dHeight; y++) {
     for (let x = 0; x < dWidth; x++) {
       const idx = y * dWidth + x;
-      if (mask[idx] === 1 && labels[idx] === 0) {
+      if (eroded[idx] === 1 && labels[idx] === 0) {
         const bounds = floodFill(
-          mask,
+          eroded,
           labels,
           dWidth,
           dHeight,
@@ -125,6 +132,26 @@ async function processImage(inputPath, outputDir, filename, opts) {
         );
         componentBounds.set(nextLabel, bounds);
         nextLabel++;
+      }
+    }
+  }
+
+  // Re-derive bounding boxes from the original (non-eroded) mask by assigning
+  // unlabelled foreground pixels to the nearest labelled component
+  expandLabelsToOriginalMask(mask, eroded, labels, dWidth, dHeight);
+  for (const [label] of componentBounds) {
+    componentBounds.set(label, { minX: dWidth, minY: dHeight, maxX: 0, maxY: 0, area: 0 });
+  }
+  for (let y = 0; y < dHeight; y++) {
+    for (let x = 0; x < dWidth; x++) {
+      const lbl = labels[y * dWidth + x];
+      if (lbl > 0 && componentBounds.has(lbl)) {
+        const b = componentBounds.get(lbl);
+        b.area++;
+        b.minX = Math.min(b.minX, x);
+        b.minY = Math.min(b.minY, y);
+        b.maxX = Math.max(b.maxX, x);
+        b.maxY = Math.max(b.maxY, y);
       }
     }
   }
@@ -181,10 +208,14 @@ async function processImage(inputPath, outputDir, filename, opts) {
     const outputName = `${baseName}_photo_${i + 1}.png`;
     const outputPath = path.join(outputDir, outputName);
 
-    await sharp(inputPath)
-      .extract({ left, top, width: cropWidth, height: cropHeight })
-      .png()
-      .toFile(outputPath);
+    let pipeline = sharp(inputPath)
+      .extract({ left, top, width: cropWidth, height: cropHeight });
+
+    if (opts.rotate >= 1 && opts.rotate <= 4) {
+      pipeline = pipeline.rotate(opts.rotate * 90);
+    }
+
+    await pipeline.png().toFile(outputPath);
 
     console.log(
       `  Saved: ${outputName} (${cropWidth}x${cropHeight} at ${left},${top})`
@@ -232,4 +263,55 @@ function floodFill(mask, labels, width, height, startX, startY, label) {
   }
 
   return bounds;
+}
+
+function erode(mask, width, height, radius) {
+  if (radius <= 0) return new Uint8Array(mask);
+  const result = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      let allFg = true;
+      for (let dy = -radius; dy <= radius && allFg; dy++) {
+        for (let dx = -radius; dx <= radius && allFg; dx++) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
+            allFg = false;
+          } else if (mask[ny * width + nx] === 0) {
+            allFg = false;
+          }
+        }
+      }
+      result[y * width + x] = allFg ? 1 : 0;
+    }
+  }
+  return result;
+}
+
+function expandLabelsToOriginalMask(mask, eroded, labels, width, height) {
+  // Assign unlabelled foreground pixels (in original mask but not in eroded)
+  // to the nearest labelled component via BFS from all labelled pixels
+  const queue = [];
+  for (let i = 0; i < mask.length; i++) {
+    if (labels[i] > 0) {
+      queue.push(i);
+    }
+  }
+
+  let head = 0;
+  while (head < queue.length) {
+    const idx = queue[head++];
+    const x = idx % width;
+    const y = (idx - x) / width;
+    const label = labels[idx];
+
+    for (const [nx, ny] of [[x+1,y],[x-1,y],[x,y+1],[x,y-1]]) {
+      if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+      const nIdx = ny * width + nx;
+      if (mask[nIdx] === 1 && labels[nIdx] === 0) {
+        labels[nIdx] = label;
+        queue.push(nIdx);
+      }
+    }
+  }
 }
