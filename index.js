@@ -15,26 +15,34 @@ const IMAGE_EXTENSIONS = new Set([
   ".bmp",
 ]);
 
-// Minimum photo area as a fraction of total image area
-const MIN_AREA_FRACTION = 0.01;
-// Padding (in pixels) to add around detected photo regions (at original resolution)
-const PADDING = 10;
-// Background threshold (0-255) - pixels brighter than this in the blurred
-// grayscale image are considered background
-const BG_THRESHOLD = 225;
-// Blur sigma applied to the downscaled detection image
-const BLUR_SIGMA = 5;
-// Scale factor for the detection pass (smaller = faster but less precise boundaries)
-const DETECTION_SCALE = 0.25;
+const DEFAULTS = {
+  minArea: 0.01,
+  padding: 10,
+  threshold: 225,
+  blur: 5,
+  scale: 0.25,
+};
 
 program
+  .name("image-split")
   .description(
     "Split scanned images containing multiple photos into individual files"
   )
-  .argument("<inputDir>", "Directory containing scanned images")
-  .argument("<outputDir>", "Directory to save cropped photos")
-  .action(async (inputDir, outputDir) => {
+  .argument("<inputDir>", "Directory containing scanned images (required)")
+  .argument("[outputDir]", "Directory to save cropped photos (default: {inputDir}/output_{timestamp})")
+  .option("--min-area <fraction>", "Minimum photo area as a fraction of total image area. Detected regions smaller than this are ignored as noise", parseFloat, DEFAULTS.minArea)
+  .option("--padding <pixels>", "Extra pixels added around each detected photo when cropping to avoid clipping edges", parseInt, DEFAULTS.padding)
+  .option("--threshold <value>", "Brightness cutoff (0-255) for distinguishing photos from the light scanner background. Pixels brighter than this are treated as background", parseInt, DEFAULTS.threshold)
+  .option("--blur <sigma>", "Gaussian blur radius applied during detection to smooth out noise and small details within photos", parseFloat, DEFAULTS.blur)
+  .option("--scale <factor>", "Downscale factor (0-1) for the detection pass. Smaller values are faster but give less precise crop boundaries", parseFloat, DEFAULTS.scale)
+  .action(async (inputDir, outputDir, opts) => {
     const absInput = path.resolve(inputDir);
+
+    if (!outputDir) {
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      outputDir = path.join(absInput, `output_${timestamp}`);
+    }
+
     const absOutput = path.resolve(outputDir);
 
     if (!fs.existsSync(absInput)) {
@@ -60,7 +68,7 @@ program
       const inputPath = path.join(absInput, file);
       console.log(`\nProcessing: ${file}`);
       try {
-        await processImage(inputPath, absOutput, file);
+        await processImage(inputPath, absOutput, file, opts);
       } catch (err) {
         console.error(`  Error processing ${file}: ${err.message}`);
       }
@@ -69,9 +77,14 @@ program
     console.log("\nDone.");
   });
 
+if (process.argv.length <= 2) {
+  program.help();
+}
+
 program.parse();
 
-async function processImage(inputPath, outputDir, filename) {
+async function processImage(inputPath, outputDir, filename, opts) {
+  const { minArea: MIN_AREA_FRACTION, padding: PADDING, threshold: BG_THRESHOLD, blur: BLUR_SIGMA, scale: DETECTION_SCALE } = opts;
   const metadata = await sharp(inputPath).metadata();
   const { width, height } = metadata;
 
@@ -116,7 +129,6 @@ async function processImage(inputPath, outputDir, filename) {
     }
   }
 
-  // Filter components by minimum area (in downscaled coordinates)
   const totalArea = dWidth * dHeight;
   const minArea = totalArea * MIN_AREA_FRACTION;
 
