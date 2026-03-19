@@ -240,7 +240,7 @@ async function processImage(inputPath, outputDir, filename, opts) {
     const cropWidth = right - left;
     const cropHeight = bottom - top;
 
-    const outputName = `${baseName}_photo_${i + 1}.png`;
+    const outputName = `${baseName}_${i + 1}.png`;
     const outputPath = path.join(outputDir, outputName);
 
     let pipeline = sharp(inputPath)
